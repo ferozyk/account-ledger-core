@@ -4,15 +4,24 @@ An in-memory, append-only, value-dated account ledger core in TypeScript. It has
 
 ## Run it
 
-Requires Node.js 22+.
+Requires Node.js 22+. Start with `npm install`.
+
+| Command | What it does |
+|---|---|
+| `npm run validate` | **Everything in one go:** typecheck, lint, format check, tests, build, then run the built app |
+| `npm run build` | Compile `src/` to JavaScript in `dist/` (deleted and rebuilt each time) |
+| `npm start` | Run the compiled app (`dist/replay.js`); needs `npm run build` first |
+| `npm run replay` | Run straight from TypeScript source, with no build step (handy while developing) |
+| `npm test` | All tests: unit, integration and end-to-end |
+| `npm run test:unit` / `test:integration` / `test:e2e` | One test level only |
+| `npm run test:known-failing` | The one deliberately failing test (see below) |
+| `npm run check` | Typecheck, lint, format check and tests, without building |
+
+The app writes the report to stdout and JSON logs to stderr. To see only the report, add `2>/dev/null`:
 
 ```sh
-npm install
-npm run replay            # the report goes to stdout, JSON logs to stderr
-npm run replay 2>/dev/null  # report only
-npm test                  # unit + integration + e2e (all green)
-npm run test:known-failing  # the one deliberately failing test (see below)
-npm run check             # typecheck + lint + format check + tests
+npm start 2>/dev/null
+npm start 2>logs.jsonl      # keep the logs in a file
 ```
 
 ## Reading the output

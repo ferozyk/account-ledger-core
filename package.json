@@ -8,14 +8,21 @@
     "node": ">=22"
   },
   "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "start": "node dist/replay.js",
     "replay": "tsx src/replay.ts",
     "test": "vitest run --exclude 'test/known-failing/**'",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:e2e": "vitest run test/e2e",
     "test:known-failing": "vitest run test/known-failing",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write src test \"*.{ts,js,json}\"",
     "format:check": "prettier --check src test \"*.{ts,js,json}\"",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm test"
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
+    "validate": "npm run check && npm run build && npm start"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
