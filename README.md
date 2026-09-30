@@ -71,7 +71,7 @@ Auth-A was approved and later settled for 185.00. Auth-B was declined. The Auth-
 - [AMBIGUITIES.md](AMBIGUITIES.md): every ambiguity found and how it was resolved
 - [REJECTED.md](REJECTED.md): the acceptance criteria I refused, and approaches abandoned mid-build
 - [NUMBERS.md](NUMBERS.md): every constant, and why that value rather than half of it
-- [DESIGN.md](DESIGN.md): architecture, trade-offs and production considerations (Part 2)
+- [Architecture-and-Tradeoffs.pdf](Architecture-and-Tradeoffs.pdf): the Part 2 document (3 pages), generated from [DESIGN.md](DESIGN.md)
 - [WORKLOG.md](WORKLOG.md): timestamped worklog
 
 ## The failing test

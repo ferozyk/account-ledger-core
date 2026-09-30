@@ -1,71 +1,67 @@
-# Design notes: architecture, trade-offs, production
+# Account Ledger Core: Architecture & Trade-offs
 
-## Append-only at scale
+## Shape of the implementation
 
-**What breaks first at 100× volume.** End-of-day fee assessment. For every account, every night, `closeDay` does three things:
+Every entry carries two dates: a **booking day** (when the system learned about it) and a **value date** (when it counts). Balances are always computed by value date. Money is held as `bigint` minor units, so there is no floating-point arithmetic, and the only rounding is exact half-even on interest. The ledger is an append-only log with per-account, per-value-day totals, so a balance costs O(days), not O(entries). Authorizations are held in a separate projection (`AuthorizationBook`) and never touch the ledger. A single-threaded engine validates each event with guard clauses, dispatches it to a small handler per event type, and records every outcome, rejections included. At end of day it re-checks overdraft fees across all value days and, on the last day, capitalizes interest calculated from the final value-dated balances. Fee idempotency is derived from the FEE entries already in the ledger, so there is no second copy of that state that could drift.
 
-1. rebuilds that account's closing balance for every day in the window (`closingBalances`);
-2. scans **all** of the account's entries to find which days already carry a fee (`chargedFeeDays`);
-3. scans all authorizations to sum the active holds (`activeHoldsMinor` filters the full `AuthorizationBook`).
+## 1. Append-only at scale
 
-So one end-of-day costs roughly O(accounts × (days in window + entries per account) + accounts × all authorizations). The last term is quadratic in the customer base. At 100× accounts it grows by 10,000×, and it would dominate long before the ledger itself becomes large.
+**What breaks first at 100× volume: the end-of-day batch.** For every account, every night, `closeDay`:
+
+1. rebuilds the closing balance for every day in the window;
+2. scans **all** of the account's entries to find days already charged a fee;
+3. scans **every authorization in the bank** to total the account's active holds, because `activeHoldsMinor` filters the whole book.
+
+Steps 1 and 2 grow linearly. Step 3 costs accounts × all authorizations, which is quadratic. 100× accounts makes it about 10,000× slower, long before the ledger's size itself becomes a problem. The same scan also runs on every authorization request, so decision latency at the point of sale grows with the size of the whole bank. That is the first failure a customer would notice.
 
 **Where state grows without limit:**
 
-- The entry log, the per-account entry arrays, and `bySourceEvent` in `Ledger`. Append-only means they are never pruned.
-- `deltaByValueDay`: one key per distinct value day, per account, for all time. The balance code only ever needs the window.
-- `outcomeLog` and the `seen` map in the engine. `seen` is the duplicate-event guard, so it has to retain every event ID ever processed.
-- `AuthorizationBook`: settled and declined authorizations are kept for good and still scanned for holds.
-- The "look back over every day" fee re-assessment. Its cost grows with how far back a value date may reach, and nothing limits that except the window.
+- the entry log, the per-account entry arrays and the source-event index (append-only, never pruned);
+- the per-value-day totals, which keep a key for every day ever used although only the window is ever queried;
+- the engine's outcome log and duplicate-event set (every event ID ever seen, forever);
+- the authorization book (declined and settled authorizations are kept and scanned forever);
+- the fee re-check window. How far back it looks is limited only by how far back a value date may reach, which is currently the whole window.
 
-**The cheapest structural change: a closed-period checkpoint.** When a day moves outside the back-dating horizon (say T−N), fold it into a per-account **carried-forward balance** plus the set of days already charged a fee, and stop allowing value dates before it. Then:
+**The cheapest structural change: a closed-period checkpoint.** Once a day falls behind a back-dating horizon (T−N business days), fold it into a per-account snapshot: the carried-forward balance plus the days already charged a fee. Value dates earlier than the checkpoint are no longer accepted. Balances then start from the snapshot, the fee re-check only covers days after the horizon, and fee idempotency reads a small set instead of scanning entries. Nothing is deleted: entries move to cold storage and remain the audit record. The engine and event model don't change. The design gains one new rule, "no value date behind the checkpoint", which is also the control proposed in §2. Two smaller changes belong with it: index active holds by account, removing an authorization when it leaves APPROVED; and limit duplicate detection to IDs within the horizon, with older IDs checked in cold storage.
 
-- balances start from the checkpoint rather than from opening;
-- fee assessment only looks at days after the horizon;
-- fee idempotency reads a small per-account set instead of scanning entries.
+## 2. Value-dated entries in production
 
-The entries themselves are not deleted, so the log stays the audit record. They move out of the hot path. Two smaller fixes belong alongside it: index active holds by account (a `Map<AccountId, Set<AuthId>>` that drops an authorization when it leaves `APPROVED`), and give the duplicate-event guard a time limit (IDs are unique within the horizon, and older IDs are checked against cold storage). None of this changes the event model. It adds one boundary: *value dates may not reach behind the checkpoint*. That boundary is also the control proposed below.
+Value dating separates *when the bank knew* from *when it counts*. In a UAE-licensed bank that creates obligations in several areas:
 
-## Value-dated entries in production
+- **Customer money and conduct.** A back-dated entry changes history: interest, overdraft fees and minimum-balance charges for past days are now different. This implementation shows the problem: fees charged when they were correct stay on the account after a later reversal restores the balance. CBUAE's consumer-protection expectations on fair, transparent charges require an explicit refund policy for these cases. Leaving it to processing order is not acceptable.
+- **Statements and disputes.** A statement already issued for the affected days becomes wrong. The bank needs a documented policy (a corrected statement, or an adjustment shown on the next one), and customer-facing records need both dates so that disputes can be resolved.
+- **Regulatory and financial reporting.** Returns to CBUAE, liquidity and reserve positions, and general-ledger postings are taken at cut-off times. A back-dated entry that crosses a cut-off changes figures that have already been reported. Every reported figure must be reproducible as it was known at the time (a booking-date view) as well as in its restated form. That is why each entry here carries both dates rather than overwriting one.
+- **Accounting periods.** Back-dating into a closed month or year changes audited figures. For profit-sharing (Islamic) accounts, the profit for a closed period has already been distributed and cannot simply be recalculated.
+- **Financial crime.** Back-dating can disguise when a transaction happened: moving it before a limit reset, out of a monitoring window, or out of an overdraft. Transaction monitoring must look at booking time, not only value date.
 
-Value dates separate *when we learned about something* from *when it counts*. In a UAE-licensed bank, that has consequences in several places:
+**The control to add before go-live: a back-dating limit, with maker-checker approval above it.** Automated channels may only post value dates within N business days of the booking day and never into a closed accounting period. Anything older goes through an operations workflow that needs a second approver and a reason code. Each of these postings appears on a daily exception report to Finance and Compliance, and the posting is logged against both dates. This is the same horizon as the checkpoint in §1, so one control addresses both the regulatory risk and the scaling risk.
 
-- **Money owed to or by the customer.** Every back-dated entry reprices past days: interest owed, overdraft fees (this build charged three fees that the final restated view no longer justifies), and any tiered or minimum-balance charges. CBUAE consumer-protection rules expect fees to be fair and transparent. A fee charged on a balance that a later reversal has restated needs a defined refund policy, not an accident of processing order.
-- **Statements and disclosures.** A statement already issued for Day 2 is now wrong. The bank has to decide whether it issues corrected statements, shows the adjustment on the next statement, or both. Customers can dispute either.
-- **Regulatory and financial reporting.** Daily and period-end returns to CBUAE, liquidity and reserve positions, and the general ledger all take balances at a cut-off time. Back-dating across a reporting cut-off changes figures that have already been reported. Every submitted figure needs to be reproducible as it was known at the time (a booking-date view), alongside the corrected value-date view. This design keeps both dates on every entry for that reason.
-- **AML and fraud.** Back-dating is a classic way to disguise a transaction's timing: moving it before a limit reset, out of a reporting window, or hiding an overdraft. Monitoring must look at booking time as well as value date.
-- **Accounting periods and Islamic products.** Back-dating across a closed month or year crosses an audited period. For Islamic accounts, profit distribution is calculated per period and cannot simply be recalculated after the fact.
+## 3. Authorization lifecycle
 
-**One control to add before go-live:** a **back-dating limit with maker-checker approval above it.** Any entry whose value date is earlier than the booking day by more than N business days, or earlier than the last closed accounting period, is rejected from automated channels. It can only be posted through an operations workflow that needs a second approver and a reason code, and every such posting feeds a daily exception report to Finance and Compliance. It is the same boundary as the checkpoint in the previous section, so a single control addresses both scaling and regulatory risk.
+In this model an authorization is created as `APPROVED` or `DECLINED`, and only an approved authorization can become `SETTLED`. A settlement for less than the hold also ends it as SETTLED, and the whole hold is released (a single-capture model). Apart from a matching settlement, an authorization in this model can end in four ways:
 
-## Authorization lifecycle
-
-An authorization in this model is `APPROVED`, `DECLINED` or `SETTLED`. A settlement for **less** than the hold (Auth-A) still counts as a matching settlement: the leftover is released. Every way an authorization can end other than a matching settlement:
-
-| How it ends | Real-world scenario | Behaviour I would require |
+| How it ends in this model | Real-world scenario | Behaviour I would require |
 |---|---|---|
-| **Declined at request** (Auth-B) | Not enough available funds at the point of sale | Recorded as history and never places a hold. Any settlement against it is rejected (`AUTHORIZATION_NOT_APPROVED`). The customer and the merchant get a decline reason code. |
-| **Never settled: the hold expires** (Auth-B, had it been approved; *not modelled*) | The merchant never sends the settlement: a cancelled order, a hotel or car-rental deposit, a failed batch | Holds must have an expiry set by merchant category (days for retail, longer for hotels and car rental). An expiry job releases the hold with an audit event. If a settlement arrives after expiry, it is still posted (see force post below), even if that pushes the account into overdraft. |
-| **Merchant cancellation or authorization reversal** (*not modelled*) | Customer cancels, the terminal times out, or the purchase is voided on the same day | A dedicated `AUTHORIZATION_REVERSAL` event that releases the hold immediately and is idempotent by original authorization ID. It must not be expressed as a ledger `REVERSAL`, because no money has moved. |
-| **Settlement over the hold** (rejected here: `SETTLEMENT_EXCEEDS_HOLD`) | Tips, fuel pre-authorizations, currency conversion differences | Accept within a per-category tolerance (e.g. +20% for restaurants, capped for fuel). Above that, send it to operations for review rather than rejecting it outright, because the scheme will still claim the money. |
-| **Second settlement of an already-settled authorization** (rejected here: `AUTHORIZATION_NOT_APPROVED`) | A duplicate clearing record, or a legitimate split shipment | Deduplicate by clearing reference. Multi-capture authorizations need an explicit "remaining hold" instead of this model's single-capture release. |
-| **Settlement with no authorization** (Auth-Z: `UNKNOWN_AUTHORIZATION`) | An offline or floor-limit transaction, or a force post by the merchant | Card-scheme rules often **oblige** the issuer to accept these. Production should post the debit and raise a dispute or chargeback case, not refuse it. Rejecting it, as this model does, leaves the bank owing the scheme money it never took from the customer. |
-| **Incremental authorization** (*not modelled*) | A hotel extends a stay, or a car rental is extended | Increases the existing hold under the same authorization ID, re-checking available funds only for the increase. |
-| **Account closed or frozen while a hold is active** (*not modelled*) | A compliance freeze or a closed account | The hold stays in place until expiry or settlement. A settlement is posted and then goes to account recovery. |
+| **Declined at request.** Terminal state; no hold is placed. A later settlement is rejected as `AUTHORIZATION_NOT_APPROVED`. | Not enough available funds at the point of sale, or a blocked card or account. | Return a decline reason to the scheme. Keep the record for fraud and dispute evidence. A later settlement is a force post (see the last row). |
+| **Settled for less than the hold.** SETTLED; the unused remainder is released. | A final amount below the estimate: fuel, a cancelled item, a hotel deposit larger than the bill. | Release the remainder at settlement, as the model does. For split shipments, support multiple captures with a "remaining hold" balance instead of releasing everything at the first capture. |
+| **Never settled.** Stays APPROVED, and the hold reduces available balance indefinitely. There is no expiry in the model. | The merchant never sends the settlement: an abandoned order, a car-rental or hotel deposit, a failed clearing batch, a merchant-side cancellation that never reached the issuer. | Holds must expire after a period set by merchant category (days for retail, weeks for travel). Expiry releases the hold and writes an audit event. Merchant cancellations should arrive as an explicit authorization reversal that is idempotent by authorization ID. That is not a ledger reversal, because no money moved. |
+| **Settlement rejected, authorization left open.** Over-capture (`SETTLEMENT_EXCEEDS_HOLD`), a currency or account mismatch, or a second settlement of an already-settled authorization. The hold remains, or the attempt is refused. | Tips and currency-conversion differences (over-capture), a routing error, a resent clearing record. | Accept over-capture within a per-merchant-category tolerance and send anything above it to review. The scheme will claim the money either way, so an outright refusal only creates a reconciliation break. Detect duplicates by the clearing record's reference, not by authorization ID alone. |
 
-## What I cut, and why
+The model also refuses a settlement that has **no authorization**, and no money moves. Card-scheme rules often oblige the issuer to honour these (offline or below-floor-limit transactions, force posts). In production the debit should be posted and routed to disputes and chargebacks, not refused. Refusing it means the scheme is owed money that was never taken from the customer.
+
+## 4. What I cut, and why
 
 | Simplification | Production risk it defers |
 |---|---|
-| Everything in memory, single process, no persistence | A crash loses all state. Production needs a durable, ordered event log (replayable, which this design already assumes), transactional appends, and snapshots. |
-| No concurrency: events are processed strictly one at a time | Two authorizations on the same account at the same moment could both pass the available-balance check. Production needs per-account serialisation (single-writer partitioning or row-level locks) with idempotency keys. |
-| Integer days, no calendar, no time zones or holidays | Real value dates use business-day calendars (UAE weekend, public holidays, per-currency settlement calendars), and the end-of-day cut-off time matters. |
-| No FX; fees only configured for AED | A BHD account going negative raises `FEE_NOT_CONFIGURED` rather than being charged. Multi-currency fee schedules and FX sourcing are not designed. |
-| No fee refund or re-evaluation policy | Customers pay fees caused by reversed transactions (see the failing test). This is conduct risk under CBUAE consumer protection. |
-| Single-capture authorizations, no expiry, no authorization reversal, no over-capture tolerance, force posts rejected | Holds can stay forever, available balance falls without reason, and scheme obligations aren't met. See the authorization table above. |
-| No back-dating limit | Any value date inside the window is accepted from any caller. See the control above. |
-| Duplicate detection by event ID only, kept forever | Unbounded memory. It also misses duplicates from upstream that arrive with *different* IDs (the same clearing record resent). Production needs deduplication by business key, with a time limit. |
-| Interest is simple daily accrual on the ledger balance, with no tiers, day-count convention, or minimum-balance rules | Real products need day-count conventions (Actual/365, Actual/360), tiered rates, and rules for accrual on holidays. |
-| Rejected events can't be resubmitted with the same ID | A client that retries a corrected event with the same ID is rejected as a duplicate. Needs a documented contract for retries versus corrections. |
-| Report is plain text, logs go to stderr, no metrics | No latency percentiles, fee and decline counters, or alerts on `FEE_NOT_CONFIGURED` and late events. The JSON logs carry event IDs for correlation but are not shipped anywhere. |
-| No authentication or authorization, and no input from untrusted sources | The engine trusts its caller. Any API in front of it needs auth, schema validation (`parseMoney` is already strict), and rate limiting. |
+| In memory, single process, no persistence | A crash loses everything. Production needs a durable, ordered event log, transactional appends and snapshots. The replay design assumes the log already exists. |
+| Strictly one event at a time | Two authorizations arriving at once on one account could both pass the available-balance check. Needs per-account serialisation (partitioned single writer or row locks) plus idempotency keys. |
+| Integer days; no calendar, cut-off time, holidays or time zones | Value dates depend on UAE business days, per-currency settlement calendars and a defined end-of-day cut-off time. |
+| No foreign exchange; fees configured per currency, only AED set | An overdrawn account in another currency raises `FEE_NOT_CONFIGURED` and is not charged. FX rates and multi-currency fee schedules are not designed. |
+| No fee refund or re-evaluation after reversals | Customers keep paying fees whose trigger no longer exists (captured by the annotated failing test). Conduct risk. |
+| No back-dating limit | Any caller can post into any past day of the window. See the control in §2. |
+| Single-capture authorizations; no expiry, authorization reversal, incremental authorization or over-capture tolerance; force posts refused | Holds that never clear, available balances wrongly reduced, scheme obligations breached (§3). |
+| Duplicate detection by event ID only, kept forever | Memory grows without limit, and a clearing record resent with a new ID is booked twice. Needs deduplication by business reference, with a time limit. |
+| Simple daily interest on the ledger balance | No day-count convention (Actual/365 or Actual/360), tiers, minimum balances, or profit-sharing rules. |
+| A rejected event can never be resubmitted under the same ID | Retrying a corrected event is indistinguishable from a duplicate. Needs a documented contract separating retries from corrections. |
+| No authentication, authorization, rate limiting or untrusted input path | The engine trusts its caller. An API in front of it needs identity, schema validation (amount parsing is already strict) and rate limits. |
+| Plain-text report and JSON logs to stderr; no metrics or alerts | No latency percentiles, no decline, fee or late-event rates, no alerting on configuration errors. Logs carry event IDs for correlation but are not shipped or retained anywhere. |
