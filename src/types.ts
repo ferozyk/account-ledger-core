@@ -118,7 +118,8 @@ export type RejectionCode =
   | "SETTLEMENT_EXCEEDS_HOLD"
   | "UNKNOWN_REVERSAL_TARGET"
   | "REVERSAL_NOT_ALLOWED"
-  | "ALREADY_REVERSED";
+  | "ALREADY_REVERSED"
+  | "OUTSIDE_WINDOW";
 
 export type Result<T, E> =
   { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E };
@@ -149,4 +150,66 @@ export interface Logger {
   info(event: string, fields?: LogFields): void;
   warn(event: string, fields?: LogFields): void;
   error(event: string, fields?: LogFields): void;
+}
+
+// ---------------------------------------------------------------------------
+// End-of-day reporting and the restated (value-dated) view
+// ---------------------------------------------------------------------------
+
+/** Non-fatal end-of-day problem; the day still closes. */
+export interface EodError {
+  readonly code: "FEE_NOT_CONFIGURED";
+  readonly accountId: AccountId;
+  readonly day: Day;
+}
+
+export interface AccountDayReport {
+  readonly accountId: AccountId;
+  readonly currency: Currency;
+  /** Balance by value date <= the closed day, after this end-of-day's fees and interest. */
+  readonly closingLedgerMinor: bigint;
+  readonly activeHoldsMinor: bigint;
+  readonly availableMinor: bigint;
+  /** Fee entries booked at this end-of-day (their value dates may be earlier days). */
+  readonly feesAssessed: readonly LedgerEntry[];
+  readonly interestCapitalized?: LedgerEntry;
+}
+
+/** The state of the ledger as known at the moment the day closed. */
+export interface DayReport {
+  readonly day: Day;
+  readonly accounts: readonly AccountDayReport[];
+  readonly authorizations: readonly Authorization[];
+  /** Every event booked on this day, applied and rejected. */
+  readonly outcomes: readonly EventOutcome[];
+  readonly eodErrors: readonly EodError[];
+}
+
+export interface RestatedDay {
+  readonly day: Day;
+  /** Final value-dated closing balance including the capitalized interest entry. */
+  readonly closingMinor: bigint;
+  /** The balance the interest accrual was based on (captured at capitalization time). */
+  readonly closingBeforeInterestMinor: bigint;
+  readonly dailyAccrualMinor: bigint;
+}
+
+export interface RestatedAccount {
+  readonly accountId: AccountId;
+  readonly currency: Currency;
+  readonly days: readonly RestatedDay[];
+  /** Sum of INTEREST entries in the ledger for the account. */
+  readonly capitalizedMinor: bigint;
+  readonly accrualSumMinor: bigint;
+  readonly accrualMatchesCapitalized: boolean;
+}
+
+export interface RestatedView {
+  readonly accounts: readonly RestatedAccount[];
+}
+
+export interface ReplayResult {
+  readonly dayReports: readonly DayReport[];
+  readonly restated: RestatedView;
+  readonly outcomes: readonly EventOutcome[];
 }
